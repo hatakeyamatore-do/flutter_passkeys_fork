@@ -110,7 +110,24 @@ class PasskeyAuthenticator {
         }
       }
 
-      final r = await _platform.authenticate(request);
+      final platformFuture = _platform.authenticate(request);
+
+      final AuthenticateResponseType r;
+      if (request.timeout != null) {
+        final timeout = Duration(milliseconds: request.timeout!);
+        r = await platformFuture.timeout(
+          timeout,
+          onTimeout: () async {
+            // Cancel the native CredentialManager operation to dismiss the
+            // Android System UI (e.g. BLE "connecting" bottom sheet) that would
+            // otherwise stay on top of Flutter's error dialog.
+            await _platform.cancelCurrentAuthenticatorOperation();
+            throw TimeoutException('Passkey authentication timed out');
+          },
+        );
+      } else {
+        r = await platformFuture;
+      }
 
       return r;
     } on PlatformException catch (e) {
