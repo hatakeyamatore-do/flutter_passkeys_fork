@@ -268,19 +268,48 @@ public class MessageHandler implements Messages.PasskeysApi {
             // Recreating the Activity forces the GMS overlay to detach and close.
             if (timeout != null) {
                 final long effectiveTimeout = 60000L; // TODO: remove after testing (shorten to 1 min)
+                final GetCredentialRequest finalGetCredRequest = getCredRequest;
                 cancelTimeoutTimer();
                 timeoutRunnable = () -> {
                     Log.d(TAG, "[T] Android-side timeout fired (timeout=" + effectiveTimeout + "ms)");
+                    // Step 1: cancel the existing signal (may not dismiss GMS CABLE UI)
                     if (currentCancellationSignal != null) {
                         currentCancellationSignal.cancel();
                         currentCancellationSignal = null;
                         Log.d(TAG, "[T] CancellationSignal.cancel() called");
                     }
                     timeoutRunnable = null;
-                    // cancel() does not dismiss the GMS BLE "connecting" dialog.
-                    // Recreate the Activity so the GMS overlay detaches from its window.
-                    Log.d(TAG, "[T] recreating Activity to force-dismiss GMS overlay");
-                    activity.recreate();
+                    // Step 2: issue a second getCredentialAsync with preferImmediatelyAvailableCredentials=true
+                    // GMS typically allows only one concurrent operation: receiving a new request
+                    // may force it to cancel the previous CABLE session and dismiss the QR overlay.
+                    Log.d(TAG, "[T] issuing second getCredentialAsync to force GMS session reset");
+                    CancellationSignal dummySignal = new CancellationSignal();
+                    GetCredentialRequest forceCancelRequest = new GetCredentialRequest.Builder()
+                            .addCredentialOption(new GetPublicKeyCredentialOption(
+                                    finalGetCredRequest.getCredentialOptions().get(0)
+                                            instanceof GetPublicKeyCredentialOption
+                                    ? ((GetPublicKeyCredentialOption) finalGetCredRequest
+                                            .getCredentialOptions().get(0)).getRequestJson()
+                                    : "{}"))
+                            .setPreferImmediatelyAvailableCredentials(true)
+                            .build();
+                    CredentialManager cm = CredentialManager.create(activity);
+                    cm.getCredentialAsync(activity, forceCancelRequest, dummySignal, Runnable::run,
+                            new CredentialManagerCallback<GetCredentialResponse, GetCredentialException>() {
+                                @Override
+                                public void onResult(GetCredentialResponse res) {
+                                    Log.d(TAG, "[T2] second call onResult (ignored)");
+                                    dummySignal.cancel();
+                                }
+                                @Override
+                                public void onError(GetCredentialException e) {
+                                    Log.d(TAG, "[T2] second call onError: " + e.getClass().getSimpleName()
+                                            + " / " + e.getMessage());
+                                }
+                            });
+                    // Cancel the second request immediately after starting it
+                    dummySignal.cancel();
+                    Log.d(TAG, "[T] second call dummySignal cancelled");
                 };
                 timeoutHandler.postDelayed(timeoutRunnable, effectiveTimeout);
                 Log.d(TAG, "[2] Android-side timeout timer set: " + effectiveTimeout + "ms");
