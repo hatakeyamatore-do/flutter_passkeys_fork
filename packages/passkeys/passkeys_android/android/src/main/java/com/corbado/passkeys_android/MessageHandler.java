@@ -234,6 +234,9 @@ public class MessageHandler implements Messages.PasskeysApi {
         }
         GetCredentialOptions getCredentialOptions = new GetCredentialOptions(challenge, timeout, relyingPartyId,
                 allowCredentialsType, userVerification);
+        Log.d(TAG, "[1] authenticate start: timeout=" + timeout
+                + ", allowCredentials=" + allowCredentialsType.size()
+                + ", userVerification=" + userVerification);
         try {
             String options = getCredentialOptions.toJSON().toString();
 
@@ -252,11 +255,13 @@ public class MessageHandler implements Messages.PasskeysApi {
 
             GetCredentialRequest getCredRequest = builder.build();
             currentCancellationSignal = new CancellationSignal();
+            Log.d(TAG, "[2] getCredentialAsync called (CancellationSignal created)");
 
             credentialManager.getCredentialAsync(activity, getCredRequest, currentCancellationSignal, Runnable::run,
                     new CredentialManagerCallback<GetCredentialResponse, GetCredentialException>() {
                         @Override
                         public void onResult(GetCredentialResponse res) {
+                            Log.d(TAG, "[3] onResult: credential type=" + res.getCredential().getClass().getSimpleName());
                             Credential credential = res.getCredential();
                             if (credential instanceof PublicKeyCredential) {
                                 String responseJson = ((PublicKeyCredential) credential)
@@ -280,12 +285,14 @@ public class MessageHandler implements Messages.PasskeysApi {
                                             .setAuthenticatorData(authenticatorData).setSignature(signature)
                                             .setUserHandle(userHandle).build();
 
+                                    Log.d(TAG, "[3] onResult: success, id=" + id);
                                     result.success(msg);
                                 } catch (JSONException e) {
-                                    Log.e(TAG, "Error parsing response: " + responseJson, e);
+                                    Log.e(TAG, "[3] onResult: JSON parse error", e);
                                     result.error(e);
                                 }
                             } else {
+                                Log.e(TAG, "[3] onResult: unexpected credential type=" + credential.getClass().getName());
                                 result.error(new Exception("Credential is of type " + credential.getClass().getName()
                                         + ", but should be of type PublicKeyCredential"));
                             }
@@ -293,8 +300,9 @@ public class MessageHandler implements Messages.PasskeysApi {
 
                         @Override
                         public void onError(GetCredentialException e) {
+                            Log.e(TAG, "[3] onError: type=" + e.getClass().getSimpleName()
+                                    + ", message=" + e.getMessage());
                             Exception platformException = e;
-                            Log.e(TAG, "onError called", e);
 
                             // currently, Android throws this error when users skip the fingerPrint
                             // animation => we interpret this as a cancellation for now
@@ -332,9 +340,12 @@ public class MessageHandler implements Messages.PasskeysApi {
 
     @Override
     public void cancelCurrentAuthenticatorOperation(@NonNull Messages.Result<Void> result) {
+        Log.d(TAG, "[C] cancelCurrentAuthenticatorOperation: signal="
+                + (currentCancellationSignal != null ? "exists" : "null"));
         if (currentCancellationSignal != null) {
             currentCancellationSignal.cancel();
             currentCancellationSignal = null;
+            Log.d(TAG, "[C] CancellationSignal.cancel() called");
         }
 
         result.success(null);
