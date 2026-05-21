@@ -45,6 +45,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 
 public class MessageHandler implements Messages.PasskeysApi {
@@ -57,10 +58,22 @@ public class MessageHandler implements Messages.PasskeysApi {
     private static final String TIMEOUT_ERROR = "Passkey operation timed out, please try again";
 
     private final FlutterPasskeysPlugin plugin;
+    // All CredentialManager callbacks are dispatched to the main thread so that
+    // result delivery is single-threaded with lifecycle cancellation/timeout.
+    private final Executor mainExecutor = r -> new Handler(Looper.getMainLooper()).post(r);
 
     private CancellationSignal currentCancellationSignal;
     private final Handler timeoutHandler = new Handler(Looper.getMainLooper());
     private Runnable timeoutRunnable;
+
+    // Pending result references kept as fields so that cancelOnBackground() and the
+    // timeout handler can deliver errors directly.  GMS CABLE (cross-device QR) does
+    // NOT call onError after CancellationSignal.cancel() — confirmed by testing — so
+    // we must deliver the error ourselves without waiting for the GMS callback.
+    private Messages.Result<Messages.AuthenticateResponse> pendingAuthResult;
+    private boolean authResultDelivered = false;
+    private Messages.Result<Messages.RegisterResponse> pendingRegisterResult;
+    private boolean registerResultDelivered = false;
 
     public MessageHandler(FlutterPasskeysPlugin plugin) {
         this.plugin = plugin;
@@ -100,6 +113,9 @@ public class MessageHandler implements Messages.PasskeysApi {
             return;
         }
 
+        pendingRegisterResult = result;
+        registerResultDelivered = false;
+
         UserType userType = new UserType(user.getName(), user.getDisplayName(), user.getId(), user.getIcon());
         RelyingPartyType relyingPartyType = new RelyingPartyType(relyingParty.getId(), relyingParty.getName());
         AuthenticatorSelectionType authSelectionType = null;
@@ -135,7 +151,7 @@ public class MessageHandler implements Messages.PasskeysApi {
                     options);
             currentCancellationSignal = new CancellationSignal();
             credentialManager.createCredentialAsync(activity, createPublicKeyCredentialRequest,
-                    currentCancellationSignal, Runnable::run,
+                    currentCancellationSignal, mainExecutor,
                     new CredentialManagerCallback<CreateCredentialResponse, CreateCredentialException>() {
 
                         @Override
@@ -162,7 +178,7 @@ public class MessageHandler implements Messages.PasskeysApi {
                                     typedTransports.add("");
                                 }
 
-                                result.success(new Messages.RegisterResponse.Builder()
+                                deliverRegisterSuccess(new Messages.RegisterResponse.Builder()
                                         .setId(json.getString("id"))
                                         .setRawId(json.getString("rawId"))
                                         .setClientDataJSON(response.getString("clientDataJSON"))
@@ -171,7 +187,7 @@ public class MessageHandler implements Messages.PasskeysApi {
                                         .build());
                             } catch (JSONException e) {
                                 Log.e(TAG, "Error parsing response: " + resp, e);
-                                result.error(e);
+                                deliverRegisterError(e);
                             }
                         }
 
@@ -210,12 +226,12 @@ public class MessageHandler implements Messages.PasskeysApi {
                                         e.getMessage(), e.getErrorMessage());
                             }
 
-                            result.error(platformException);
+                            deliverRegisterError(platformException);
                         }
                     });
         } catch (JSONException e) {
             Log.e(TAG, "Error creating JSON", e);
-            result.error(e);
+            deliverRegisterError(e);
         }
     }
 
@@ -229,6 +245,9 @@ public class MessageHandler implements Messages.PasskeysApi {
                     "Passkeys are only supported on Android API 28 and above.", null));
             return;
         }
+
+        pendingAuthResult = result;
+        authResultDelivered = false;
 
         List<AllowCredentialType> allowCredentialsType = new ArrayList<>();
         if (allowCredentials != null) {
@@ -261,61 +280,28 @@ public class MessageHandler implements Messages.PasskeysApi {
             currentCancellationSignal = new CancellationSignal();
             Log.d(TAG, "[2] getCredentialAsync called (CancellationSignal created)");
 
-            // Android-side timeout: dismiss the CredentialManager System UI when the
-            // WebAuthn timeout elapses. CancellationSignal.cancel() alone does NOT
-            // dismiss the GMS "connecting" overlay during a BLE-waiting CABLE flow
-            // (confirmed: onError never fires after cancel() in that state).
-            // Recreating the Activity forces the GMS overlay to detach and close.
             if (timeout != null) {
                 final long effectiveTimeout = 60000L; // TODO: remove after testing (shorten to 1 min)
-                final GetCredentialRequest finalGetCredRequest = getCredRequest;
                 cancelTimeoutTimer();
                 timeoutRunnable = () -> {
                     Log.d(TAG, "[T] Android-side timeout fired (timeout=" + effectiveTimeout + "ms)");
-                    // Step 1: cancel the existing signal (may not dismiss GMS CABLE UI)
                     if (currentCancellationSignal != null) {
                         currentCancellationSignal.cancel();
                         currentCancellationSignal = null;
                         Log.d(TAG, "[T] CancellationSignal.cancel() called");
                     }
                     timeoutRunnable = null;
-                    // Step 2: issue a second getCredentialAsync with preferImmediatelyAvailableCredentials=true
-                    // GMS typically allows only one concurrent operation: receiving a new request
-                    // may force it to cancel the previous CABLE session and dismiss the QR overlay.
-                    Log.d(TAG, "[T] issuing second getCredentialAsync to force GMS session reset");
-                    CancellationSignal dummySignal = new CancellationSignal();
-                    GetCredentialRequest forceCancelRequest = new GetCredentialRequest.Builder()
-                            .addCredentialOption(new GetPublicKeyCredentialOption(
-                                    finalGetCredRequest.getCredentialOptions().get(0)
-                                            instanceof GetPublicKeyCredentialOption
-                                    ? ((GetPublicKeyCredentialOption) finalGetCredRequest
-                                            .getCredentialOptions().get(0)).getRequestJson()
-                                    : "{}"))
-                            .setPreferImmediatelyAvailableCredentials(true)
-                            .build();
-                    CredentialManager cm = CredentialManager.create(activity);
-                    cm.getCredentialAsync(activity, forceCancelRequest, dummySignal, Runnable::run,
-                            new CredentialManagerCallback<GetCredentialResponse, GetCredentialException>() {
-                                @Override
-                                public void onResult(GetCredentialResponse res) {
-                                    Log.d(TAG, "[T2] second call onResult (ignored)");
-                                    dummySignal.cancel();
-                                }
-                                @Override
-                                public void onError(GetCredentialException e) {
-                                    Log.d(TAG, "[T2] second call onError: " + e.getClass().getSimpleName()
-                                            + " / " + e.getMessage());
-                                }
-                            });
-                    // Cancel the second request immediately after starting it
-                    dummySignal.cancel();
-                    Log.d(TAG, "[T] second call dummySignal cancelled");
+                    // GMS CABLE does not call onError after cancel(); deliver the timeout
+                    // error directly so Flutter receives it and can show the appropriate UI.
+                    Log.d(TAG, "[T] delivering android-timeout error directly to Flutter");
+                    deliverAuthError(new Messages.FlutterError("android-timeout",
+                            "Passkey operation timed out", TIMEOUT_ERROR));
                 };
                 timeoutHandler.postDelayed(timeoutRunnable, effectiveTimeout);
                 Log.d(TAG, "[2] Android-side timeout timer set: " + effectiveTimeout + "ms");
             }
 
-            credentialManager.getCredentialAsync(activity, getCredRequest, currentCancellationSignal, Runnable::run,
+            credentialManager.getCredentialAsync(activity, getCredRequest, currentCancellationSignal, mainExecutor,
                     new CredentialManagerCallback<GetCredentialResponse, GetCredentialException>() {
                         @Override
                         public void onResult(GetCredentialResponse res) {
@@ -345,14 +331,14 @@ public class MessageHandler implements Messages.PasskeysApi {
                                             .setUserHandle(userHandle).build();
 
                                     Log.d(TAG, "[3] onResult: success, id=" + id);
-                                    result.success(msg);
+                                    deliverAuthSuccess(msg);
                                 } catch (JSONException e) {
                                     Log.e(TAG, "[3] onResult: JSON parse error", e);
-                                    result.error(e);
+                                    deliverAuthError(e);
                                 }
                             } else {
                                 Log.e(TAG, "[3] onResult: unexpected credential type=" + credential.getClass().getName());
-                                result.error(new Exception("Credential is of type " + credential.getClass().getName()
+                                deliverAuthError(new Exception("Credential is of type " + credential.getClass().getName()
                                         + ", but should be of type PublicKeyCredential"));
                             }
                         }
@@ -390,7 +376,7 @@ public class MessageHandler implements Messages.PasskeysApi {
                                         e.getMessage(), e.getErrorMessage());
                             }
 
-                            result.error(platformException);
+                            deliverAuthError(platformException);
                         }
                     });
         } catch (JSONException e) {
@@ -408,7 +394,8 @@ public class MessageHandler implements Messages.PasskeysApi {
             currentCancellationSignal = null;
             Log.d(TAG, "[C] CancellationSignal.cancel() called");
         }
-
+        deliverAuthError(new Messages.FlutterError("cancelled", "Passkey operation cancelled", ""));
+        deliverRegisterError(new Messages.FlutterError("cancelled", "Passkey operation cancelled", ""));
         result.success(null);
     }
 
@@ -424,6 +411,12 @@ public class MessageHandler implements Messages.PasskeysApi {
             currentCancellationSignal = null;
             Log.d(TAG, "[P] CancellationSignal cancelled");
         }
+        // GMS CABLE does not call onError after cancel(); deliver the error directly.
+        Log.d(TAG, "[P] delivering cancelled error directly to Flutter");
+        deliverAuthError(new Messages.FlutterError("cancelled",
+                "Passkey operation cancelled: app went to background", ""));
+        deliverRegisterError(new Messages.FlutterError("cancelled",
+                "Passkey operation cancelled: app went to background", ""));
     }
 
     private void cancelTimeoutTimer() {
@@ -432,5 +425,37 @@ public class MessageHandler implements Messages.PasskeysApi {
             timeoutRunnable = null;
             Log.d(TAG, "[T] timeout timer cancelled");
         }
+    }
+
+    private void deliverAuthSuccess(Messages.AuthenticateResponse msg) {
+        if (authResultDelivered || pendingAuthResult == null) return;
+        authResultDelivered = true;
+        Messages.Result<Messages.AuthenticateResponse> r = pendingAuthResult;
+        pendingAuthResult = null;
+        r.success(msg);
+    }
+
+    private void deliverAuthError(Exception e) {
+        if (authResultDelivered || pendingAuthResult == null) return;
+        authResultDelivered = true;
+        Messages.Result<Messages.AuthenticateResponse> r = pendingAuthResult;
+        pendingAuthResult = null;
+        r.error(e);
+    }
+
+    private void deliverRegisterSuccess(Messages.RegisterResponse msg) {
+        if (registerResultDelivered || pendingRegisterResult == null) return;
+        registerResultDelivered = true;
+        Messages.Result<Messages.RegisterResponse> r = pendingRegisterResult;
+        pendingRegisterResult = null;
+        r.success(msg);
+    }
+
+    private void deliverRegisterError(Exception e) {
+        if (registerResultDelivered || pendingRegisterResult == null) return;
+        registerResultDelivered = true;
+        Messages.Result<Messages.RegisterResponse> r = pendingRegisterResult;
+        pendingRegisterResult = null;
+        r.error(e);
     }
 }
