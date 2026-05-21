@@ -412,6 +412,20 @@ public class MessageHandler implements Messages.PasskeysApi {
         result.success(null);
     }
 
+    // Called by FlutterPasskeysPlugin when the app transitions to background (onStop).
+    // Mirrors iOS ASAuthorizationController behaviour: cancel any pending credential
+    // operation so the Dart side receives an error and can show the appropriate UI
+    // when the user returns to the app.
+    public void cancelOnBackground() {
+        Log.d(TAG, "[P] app went to background, cancelling pending operation");
+        cancelTimeoutTimer();
+        if (currentCancellationSignal != null) {
+            currentCancellationSignal.cancel();
+            currentCancellationSignal = null;
+            Log.d(TAG, "[P] CancellationSignal cancelled");
+        }
+    }
+
     private void cancelTimeoutTimer() {
         if (timeoutRunnable != null) {
             timeoutHandler.removeCallbacks(timeoutRunnable);
