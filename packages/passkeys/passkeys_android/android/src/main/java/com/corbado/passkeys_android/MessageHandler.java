@@ -267,10 +267,10 @@ public class MessageHandler implements Messages.PasskeysApi {
             // (confirmed: onError never fires after cancel() in that state).
             // Recreating the Activity forces the GMS overlay to detach and close.
             if (timeout != null) {
-                timeout = 60000L; // TODO: remove after testing (shorten to 1 min)
+                final long effectiveTimeout = 60000L; // TODO: remove after testing (shorten to 1 min)
                 cancelTimeoutTimer();
                 timeoutRunnable = () -> {
-                    Log.d(TAG, "[T] Android-side timeout fired (timeout=" + timeout + "ms)");
+                    Log.d(TAG, "[T] Android-side timeout fired (timeout=" + effectiveTimeout + "ms)");
                     if (currentCancellationSignal != null) {
                         currentCancellationSignal.cancel();
                         currentCancellationSignal = null;
@@ -282,8 +282,8 @@ public class MessageHandler implements Messages.PasskeysApi {
                     Log.d(TAG, "[T] recreating Activity to force-dismiss GMS overlay");
                     activity.recreate();
                 };
-                timeoutHandler.postDelayed(timeoutRunnable, timeout);
-                Log.d(TAG, "[2] Android-side timeout timer set: " + timeout + "ms");
+                timeoutHandler.postDelayed(timeoutRunnable, effectiveTimeout);
+                Log.d(TAG, "[2] Android-side timeout timer set: " + effectiveTimeout + "ms");
             }
 
             credentialManager.getCredentialAsync(activity, getCredRequest, currentCancellationSignal, Runnable::run,
