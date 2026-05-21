@@ -2,6 +2,8 @@ package com.corbado.passkeys_android;
 
 import android.app.Activity;
 import android.os.CancellationSignal;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -57,6 +59,8 @@ public class MessageHandler implements Messages.PasskeysApi {
     private final FlutterPasskeysPlugin plugin;
 
     private CancellationSignal currentCancellationSignal;
+    private final Handler timeoutHandler = new Handler(Looper.getMainLooper());
+    private Runnable timeoutRunnable;
 
     public MessageHandler(FlutterPasskeysPlugin plugin) {
         this.plugin = plugin;
@@ -257,10 +261,29 @@ public class MessageHandler implements Messages.PasskeysApi {
             currentCancellationSignal = new CancellationSignal();
             Log.d(TAG, "[2] getCredentialAsync called (CancellationSignal created)");
 
+            // Android-side timeout: directly cancel the CredentialManager when the
+            // WebAuthn timeout elapses. This is needed because the Dart-side
+            // Future.timeout() does not reliably dismiss the System UI bottom sheet
+            // (e.g. BLE "connecting" state when Bluetooth is off on Android).
+            if (timeout != null) {
+                cancelTimeoutTimer();
+                timeoutRunnable = () -> {
+                    Log.d(TAG, "[T] Android-side timeout fired (timeout=" + timeout + "ms), cancelling CancellationSignal");
+                    if (currentCancellationSignal != null) {
+                        currentCancellationSignal.cancel();
+                        currentCancellationSignal = null;
+                    }
+                    timeoutRunnable = null;
+                };
+                timeoutHandler.postDelayed(timeoutRunnable, timeout);
+                Log.d(TAG, "[2] Android-side timeout timer set: " + timeout + "ms");
+            }
+
             credentialManager.getCredentialAsync(activity, getCredRequest, currentCancellationSignal, Runnable::run,
                     new CredentialManagerCallback<GetCredentialResponse, GetCredentialException>() {
                         @Override
                         public void onResult(GetCredentialResponse res) {
+                            cancelTimeoutTimer();
                             Log.d(TAG, "[3] onResult: credential type=" + res.getCredential().getClass().getSimpleName());
                             Credential credential = res.getCredential();
                             if (credential instanceof PublicKeyCredential) {
@@ -300,6 +323,7 @@ public class MessageHandler implements Messages.PasskeysApi {
 
                         @Override
                         public void onError(GetCredentialException e) {
+                            cancelTimeoutTimer();
                             Log.e(TAG, "[3] onError: type=" + e.getClass().getSimpleName()
                                     + ", message=" + e.getMessage());
                             Exception platformException = e;
@@ -342,6 +366,7 @@ public class MessageHandler implements Messages.PasskeysApi {
     public void cancelCurrentAuthenticatorOperation(@NonNull Messages.Result<Void> result) {
         Log.d(TAG, "[C] cancelCurrentAuthenticatorOperation: signal="
                 + (currentCancellationSignal != null ? "exists" : "null"));
+        cancelTimeoutTimer();
         if (currentCancellationSignal != null) {
             currentCancellationSignal.cancel();
             currentCancellationSignal = null;
@@ -349,5 +374,13 @@ public class MessageHandler implements Messages.PasskeysApi {
         }
 
         result.success(null);
+    }
+
+    private void cancelTimeoutTimer() {
+        if (timeoutRunnable != null) {
+            timeoutHandler.removeCallbacks(timeoutRunnable);
+            timeoutRunnable = null;
+            Log.d(TAG, "[T] timeout timer cancelled");
+        }
     }
 }
