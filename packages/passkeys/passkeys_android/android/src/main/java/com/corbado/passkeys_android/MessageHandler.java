@@ -261,19 +261,26 @@ public class MessageHandler implements Messages.PasskeysApi {
             currentCancellationSignal = new CancellationSignal();
             Log.d(TAG, "[2] getCredentialAsync called (CancellationSignal created)");
 
-            // Android-side timeout: directly cancel the CredentialManager when the
-            // WebAuthn timeout elapses. This is needed because the Dart-side
-            // Future.timeout() does not reliably dismiss the System UI bottom sheet
-            // (e.g. BLE "connecting" state when Bluetooth is off on Android).
+            // Android-side timeout: dismiss the CredentialManager System UI when the
+            // WebAuthn timeout elapses. CancellationSignal.cancel() alone does NOT
+            // dismiss the GMS "connecting" overlay during a BLE-waiting CABLE flow
+            // (confirmed: onError never fires after cancel() in that state).
+            // Recreating the Activity forces the GMS overlay to detach and close.
             if (timeout != null) {
+                timeout = 60000L; // TODO: remove after testing (shorten to 1 min)
                 cancelTimeoutTimer();
                 timeoutRunnable = () -> {
-                    Log.d(TAG, "[T] Android-side timeout fired (timeout=" + timeout + "ms), cancelling CancellationSignal");
+                    Log.d(TAG, "[T] Android-side timeout fired (timeout=" + timeout + "ms)");
                     if (currentCancellationSignal != null) {
                         currentCancellationSignal.cancel();
                         currentCancellationSignal = null;
+                        Log.d(TAG, "[T] CancellationSignal.cancel() called");
                     }
                     timeoutRunnable = null;
+                    // cancel() does not dismiss the GMS BLE "connecting" dialog.
+                    // Recreate the Activity so the GMS overlay detaches from its window.
+                    Log.d(TAG, "[T] recreating Activity to force-dismiss GMS overlay");
+                    activity.recreate();
                 };
                 timeoutHandler.postDelayed(timeoutRunnable, timeout);
                 Log.d(TAG, "[2] Android-side timeout timer set: " + timeout + "ms");
